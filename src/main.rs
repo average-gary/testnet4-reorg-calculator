@@ -249,7 +249,7 @@ fn display_calculation(calc: &ReorgCalculation, provided_hashrate: f64) {
     }
 }
 
-fn save_to_file(calculations: &[ReorgCalculation], filename: &str) -> Result<()> {
+fn save_to_file(calculations: &[ReorgCalculation], filename: &str, provided_hashrate: f64) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -265,7 +265,7 @@ fn save_to_file(calculations: &[ReorgCalculation], filename: &str) -> Result<()>
         writeln!(file, "Total Work: {:.2}", calc.total_work)?;
         writeln!(file, "Current Difficulty: {:.2}", calc.current_difficulty)?;
         writeln!(file, "Blocks Needed: {:.0}", calc.blocks_needed)?;
-        writeln!(file, "Time Required (1 PH/s): {:.2} days", calc.time_required_days)?;
+        writeln!(file, "Time Required ({}): {:.2} days", format_hashrate(provided_hashrate), calc.time_required_days)?;
         writeln!(file, "Hashrate for 3 days: {}", format_hashrate(calc.hashrate_required))?;
         writeln!(file, "Timestamp: {}", calc.timestamp.format("%Y-%m-%d %H:%M:%S UTC"))?;
         writeln!(file, "---")?;
@@ -335,7 +335,7 @@ fn main() -> Result<()> {
     
     // Save results
     let output_file = env::var("OUTPUT_FILE").unwrap_or_else(|_| "reorg_calculations.txt".to_string());
-    save_to_file(&calculations, &output_file)?;
+    save_to_file(&calculations, &output_file, hashrate)?;
     
     Ok(())
 }
