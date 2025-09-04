@@ -2,10 +2,17 @@ use anyhow::{Context, Result};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use dashmap::DashMap;
 use dotenvy::dotenv;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::Arc;
+
+#[cfg(feature = "tui")]
+mod tui;
 
 const HASHES_PER_DIFFICULTY: f64 = 4294967296.0; // 2^32
 const SECONDS_PER_DAY: f64 = 86400.0;
@@ -40,6 +47,18 @@ struct Args {
     /// Calculate multiple target heights
     #[arg(long)]
     batch_calculate: bool,
+    
+    /// Launch interactive TUI mode
+    #[arg(long)]
+    tui: bool,
+    
+    /// Number of parallel RPC threads for historical queries
+    #[arg(long, default_value = "8")]
+    threads: usize,
+    
+    /// Batch size for RPC requests
+    #[arg(long, default_value = "100")]
+    batch_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +137,18 @@ fn bits_to_difficulty(bits: u32) -> f64 {
 }
 
 fn calculate_chain_work(client: &Client, fork_height: u64, current_height: u64) -> Result<f64> {
+    let total_blocks = current_height - fork_height + 1;
+    
+    if total_blocks <= 100 {
+        // Use simple sequential method for small ranges
+        return calculate_chain_work_sequential(client, fork_height, current_height);
+    }
+    
+    // Use optimized parallel method for large ranges
+    calculate_chain_work_parallel(client, fork_height, current_height)
+}
+
+fn calculate_chain_work_sequential(client: &Client, fork_height: u64, current_height: u64) -> Result<f64> {
     let mut total_work = 0.0;
     println!("Calculating chain work from block {} to {}...", fork_height, current_height);
     
@@ -131,6 +162,84 @@ fn calculate_chain_work(client: &Client, fork_height: u64, current_height: u64) 
     }
     
     Ok(total_work)
+}
+
+fn calculate_chain_work_parallel(client: &Client, fork_height: u64, current_height: u64) -> Result<f64> {
+    let total_blocks = current_height - fork_height + 1;
+    println!("Calculating chain work from block {} to {} ({} blocks)...", fork_height, current_height, total_blocks);
+    
+    // Setup progress bar
+    let pb = ProgressBar::new(total_blocks);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} blocks ({eta})")?
+        .progress_chars("#>-"));
+    
+    // Create difficulty cache
+    let cache: Arc<DashMap<u64, f64>> = Arc::new(DashMap::new());
+    
+    // Create multiple client connections for parallel processing
+    let rpc_url = format!("http://127.0.0.1:{}", get_rpc_port()?);
+    let (rpc_user, rpc_pass) = get_rpc_credentials()?;
+    
+    // Process in batches to avoid overwhelming the RPC server
+    let batch_size = 100;
+    let mut total_work = 0.0;
+    
+    for chunk_start in (fork_height..=current_height).step_by(batch_size) {
+        let chunk_end = (chunk_start + batch_size as u64 - 1).min(current_height);
+        let heights: Vec<u64> = (chunk_start..=chunk_end).collect();
+        
+        // Process this batch in parallel
+        let batch_results: Result<Vec<f64>, _> = heights
+            .par_iter()
+            .map(|&height| {
+                // Check cache first
+                if let Some(cached_difficulty) = cache.get(&height) {
+                    pb.inc(1);
+                    return Ok::<f64, anyhow::Error>(*cached_difficulty);
+                }
+                
+                // Create a new client for this thread
+                let thread_client = Client::new(
+                    &rpc_url,
+                    Auth::UserPass(rpc_user.clone(), rpc_pass.clone()),
+                )?;
+                
+                let difficulty = get_block_difficulty(&thread_client, height)?;
+                
+                // Cache the result
+                cache.insert(height, difficulty);
+                pb.inc(1);
+                
+                Ok(difficulty)
+            })
+            .collect();
+        
+        // Add this batch's work to total
+        let batch_work: f64 = batch_results?.iter().sum();
+        total_work += batch_work;
+        
+        // Show progress every 10 batches
+        if chunk_start % (batch_size as u64 * 10) == fork_height || chunk_end == current_height {
+            pb.println(format!("  Processed up to block {} (current total work: {:.2})", chunk_end, total_work));
+        }
+    }
+    
+    pb.finish_with_message("Chain work calculation complete");
+    Ok(total_work)
+}
+
+fn get_rpc_port() -> Result<u16> {
+    Ok(env::var("RPC_PORT")
+        .unwrap_or_else(|_| "48337".to_string())
+        .parse()
+        .context("Invalid RPC_PORT")?)
+}
+
+fn get_rpc_credentials() -> Result<(String, String)> {
+    let user = env::var("RPC_USER").unwrap_or_else(|_| "myusername".to_string());
+    let pass = env::var("RPC_PASSWORD").unwrap_or_else(|_| "mypassword".to_string());
+    Ok((user, pass))
 }
 
 fn calculate_reorg_requirements(
@@ -288,6 +397,17 @@ fn main() -> Result<()> {
     
     let final_rpc_url = format!("http://127.0.0.1:{}", rpc_port);
     let client = connect_to_node(&final_rpc_url, &rpc_user, &rpc_password)?;
+    
+    // Handle TUI mode
+    #[cfg(feature = "tui")]
+    if args.tui {
+        return tui::run_tui(client, hashrate, target_days);
+    }
+    
+    #[cfg(not(feature = "tui"))]
+    if args.tui {
+        return Err(anyhow::anyhow!("TUI mode not available. Compile with --features tui"));
+    }
     
     println!("Connected to Testnet4 node at {}", final_rpc_url);
     let current_height = client.get_block_count()?;
