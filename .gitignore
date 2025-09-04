@@ -1,0 +1,16 @@
+# Rust
+/target/
+Cargo.lock
+
+# Output files
+reorg_calculations.txt
+
+# Environment
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
